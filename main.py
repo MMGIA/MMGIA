@@ -1,194 +1,278 @@
-import argparse
-import pickle
-
-import torch
 import time
-
-from dlg import *
-import copy
-from util.util import *
-from util.plot_util import *
-
-from torch.optim import Adam
-import torch.nn as nn
+import os
 import numpy as np
-import math
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
+from torchvision import datasets, transforms
+import pickle
+import PIL.Image as Image
+import os
 
 
-def main(args):
-    torch.backends.cudnn.enabled = False
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    start_time = time.time()
+class LeNet(nn.Module):
+    def __init__(self, channel=3, hideen=768, num_classes=10):  # hidden是神经网络最后一层全连接层的维度
+        super(LeNet, self).__init__()
+        act = nn.Sigmoid
+        self.body = nn.Sequential(
+            nn.Conv2d(channel, 12, kernel_size=5, padding=5 // 2, stride=2),  # 输入张量大小，输出张量大小，卷积核的大小,填充，步长
+            act(),
+            nn.Conv2d(12, 12, kernel_size=5, padding=5 // 2, stride=2),
+            act(),
+            nn.Conv2d(12, 12, kernel_size=5, padding=5 // 2, stride=1),
+            act(),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(hideen, num_classes)  # 全连接层
+        )
 
-    save_path = 'result' + r'\expe_[{}]_{}'.format(args.experiment_name,
-                                                   time.strftime('%m-%d-%H-%M-%S', time.localtime(start_time)))
+    # 前向传播
+    def forward(self, x):
+        out = self.body(x)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
+
+def weights_init(m):
+    try:
+        # hasattr()函数 用于判断对象是否包含对应的属性。
+        if hasattr(m, "weight"):
+            # 使用均匀分布U(a,b)初始化Tensor，即Tensor的填充值是等概率的范围为 [a，b) 的值。均值为 （a + b）/ 2.
+            m.weight.data.uniform_(-0.5, 0.5)
+    except Exception:
+        print('warning: failed in weights_init for %s.weight' % m._get_name())
+    try:
+        if hasattr(m, "bias"):
+            m.bias.data.uniform_(-0.5, 0.5)
+    except Exception:
+        print('warning: failed in weights_init for %s.bias' % m._get_name())
+
+
+class Dataset_from_Image(Dataset):
+    def __init__(self, imgs, labs, transform=None):
+        self.imgs = imgs  # img paths
+        self.labs = labs  # labs is ndarray
+        self.transform = transform
+        del imgs, labs
+
+    def __len__(self):
+        return self.labs.shape[0]
+
+    def __getitem__(self, idx):
+        lab = self.labs[idx]
+        img = Image.open(self.imgs[idx])
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img = self.transform(img)
+        return img, lab
+
+
+def lfw_dataset(lfw_path, shape_img):
+    images_all = []
+    labels_all = []
+    folders = os.listdir(lfw_path)
+    for foldidx, fold in enumerate(folders):
+        files = os.listdir(os.path.join(lfw_path, fold))
+        for f in files:
+            if len(f) > 4 and f[-4:] == '.jpg':
+                images_all.append(os.path.join(lfw_path, fold, f))
+                labels_all.append(foldidx)
+
+    transform = transforms.Compose([transforms.Resize(size=shape_img)])
+    dst = Dataset_from_Image(images_all, np.asarray(labels_all, dtype=int), transform=transform)
+    return dst
+
+
+def main():
+    dataset = 'MNIST'
+    root_path = '.'
+    data_path = os.path.join(root_path, './data/MNIST').replace('\\', '/')
+    save_path = os.path.join(root_path, './results/iDLG_%s' % dataset).replace('\\', '/')
+
+    lr = 1.0
+    num_dummy = 1
+    Iteration = 300
+    num_exp = 1000
+
+    use_cuda = torch.cuda.is_available()
+    device = 'cuda' if use_cuda else 'cpu'
+
+    tt = transforms.Compose([transforms.ToTensor()])
+    tp = transforms.Compose([transforms.ToPILImage()])
+
+    print(dataset, 'root_path:', root_path)
+    print(dataset, 'data_path:', data_path)
+    print(dataset, 'save_path:', save_path)
+
+    if not os.path.exists('results'):
+        os.mkdir('results')
     if not os.path.exists(save_path):
         os.mkdir(save_path)
 
-    for arg in vars(args):
-        print(format(arg, '<20'), format(str(getattr(args, arg)), '<'))  # str, arg_type
-    save_args(args, save_path)
+    ''' load data '''
+    if dataset == 'MNIST':
+        shape_img = (28, 28)
+        num_classes = 10
+        channel = 1
+        hidden = 588
+        dst = datasets.MNIST(data_path, download=True)
 
-    dataset, scaler = init_dataset(args)
-    for er in range(args.experiment_rounds):
-        print("====== Repeat {} ======".format(er))
-        # ========================= START TRAIN ==============================
-        model = init_model(args,
-                           model_name=args.model_name,
-                           input_size=2,
-                           hidden_size=args.hidden_size,
-                           output_size=2)
-        model = model.to(device)
-
-        loss_fn = init_loss(args.model_name).to(device)
-
-        # 记录
-        gt_data_list = []
-        gt_tim_list = []
-        gt_label_list = []
-        true_loss_list = []
-
-        model.train()
-
-        for iter in range(args.global_iterations):
-            print("------Iteration {}------".format(iter))
-            # 获取数据
-            batch_size = args.batch_size
-            gt_data_np = dataset[iter: iter + batch_size, [2, 3]]
-            gt_tim_np = dataset[iter: iter + batch_size, [0]]
-            gt_label_np = dataset[iter + batch_size, [2, 3]]
-
-            # 记录
-            gt_data_list.append(gt_data_np)
-            gt_tim_list.append(gt_tim_np)
-            gt_label_list.append(gt_label_np)
-
-            if iter == 0:
-                continue
-
-            # 原任务训练
-            true_loss = train_for_loss(args,
-                                       model_name=args.model_name,
-                                       model=model,
-                                       loss_fn=loss_fn,
-                                       batch_size=batch_size,
-                                       gt_data_np=gt_data_np,
-                                       gt_tim_np=gt_tim_np,
-                                       gt_label_np=gt_label_np,
-                                       global_iter=iter,
-                                       dataset=dataset,
-                                       device=device
-                                       )
-
-            true_loss_list.append(true_loss.item())
-            dy_dx = torch.autograd.grad(true_loss, model.parameters(), retain_graph=True)
-
-            # # =========================================== DP-SGD ============================================ #
-            # if args.is_DP:
-            #     for d in dy_dx:
-            #         norm2 = torch.norm(d, p=2)
-            #         d.data = d.data / max(1, norm2 / args.dp_C)
-            #         mean = torch.zeros(d.shape)
-            #         std = math.sqrt(2 * math.log(1.25 / args.dp_delta)) / args.dp_epsilon * args.dp_C
-            #         noise = torch.normal(mean, std).to(device)
-            #         d.data = d.data + noise
-            # # ============================================================================================= #
-
-            # =========================================== dlg attack =========================================== #
-            if args.is_dlg == 1 and iter == 1:
-                attack_record = dlg_attack(args,
-                                           batch_size=args.batch_size,
-                                           model=copy.deepcopy(model),
-                                           true_dy_dx=dy_dx,
-                                           dlg_attack_round=args.dlg_attack_rounds,
-                                           dlg_iteration=args.dlg_iterations,
-                                           dlg_lr=args.dlg_lr,
-                                           global_iter=iter,
-                                           model_name=args.model_name,
-                                           gt_data_np=gt_data_np,
-                                           gt_tim_np=gt_tim_np,
-                                           gt_label_np=gt_label_np,
-                                           save_path=save_path,
-                                           device=device,
-                                           dataset=dataset,
-                                           er=er,
-                                           )
-            # ================================================================================================== #
-
-            for server_param, grad_param in zip(model.parameters(), dy_dx):
-                server_param.data = server_param.data - args.lr * grad_param.data.clone()
-
-            print("Iter {} origin task: true_loss:{}".format(iter, true_loss))
-
-        pickle.dump(gt_data_list, open(save_path + '/gt_data_list_er={}.pickle'.format(er), 'wb'))
-        pickle.dump(gt_tim_list, open(save_path + '/gt_tim_list_er={}.pickle'.format(er), 'wb'))
-        pickle.dump(gt_label_list, open(save_path + '/gt_label_list_er={}.pickle'.format(er), 'wb'))
-        pickle.dump(true_loss_list, open(save_path + '/true_loss_list_er={}.pickle'.format(er), 'wb'))
-        print("Finish Train!")
-
-        # ====================== START TEST ==========================
-        print("Start Test!")
-        model.eval()
-        test_data_list = []
-        test_label_list = []
-        test_pred_list = []
-        for i in tqdm(range(2000, 2100)):
-            batch_size = args.batch_size
-            gt_data_np = dataset[i: i + batch_size, [2, 3]]
-            gt_tim_np = dataset[i: i + batch_size, [0]]
-            gt_label_np = dataset[i + batch_size, [2, 3]]
-            test_data_list.append(gt_data_np)
-            test_label_list.append(gt_label_np)
-            gt_data = torch.from_numpy(gt_data_np.reshape(1, batch_size, 2).astype(np.float32)).to(device)
-            pred = model(gt_data)
-            test_pred_list.append(pred.cpu().detach().numpy())
-        pickle.dump(test_data_list, open(save_path + '/test_data_list_er={}.pickle'.format(er), 'wb'))
-        pickle.dump(test_label_list, open(save_path + '/test_label_list_er={}.pickle'.format(er), 'wb'))
-        pickle.dump(test_pred_list, open(save_path + '/test_pred_list_er={}.pickle'.format(er), 'wb'))
-        print("Finished Test!")
+    elif dataset == 'cifar100':
+        shape_img = (32, 32)
+        num_classes = 100
+        channel = 3
+        hidden = 768
+        dst = datasets.CIFAR100(data_path, download=True)
 
 
+    elif dataset == 'lfw':
+        shape_img = (32, 32)
+        num_classes = 5749
+        channel = 3
+        hidden = 768
+        lfw_path = os.path.join(root_path, './data/lfw')
+        dst = lfw_dataset(lfw_path, shape_img)
+        # dst = lfw_dataset(data_path, shape_img)
+
+    else:
+        exit('unknown dataset')
+
+    ''' train DLG and iDLG '''
+    for idx_net in range(num_exp):
+        net = LeNet(channel=channel, hideen=hidden, num_classes=num_classes)
+        net.apply(weights_init)
+
+        print('running %d|%d experiment' % (idx_net, num_exp))
+        net = net.to(device)
+        idx_shuffle = np.random.permutation(len(dst))
+
+        for method in ['DLG', 'iDLG']:
+            print('%s, Try to generate %d images' % (method, num_dummy))
+
+            criterion = nn.CrossEntropyLoss().to(device)  # 计算交叉熵损失函数
+            imidx_list = []
+
+            for imidx in range(num_dummy):
+                idx = idx_shuffle[imidx]
+                imidx_list.append(idx)
+                tmp_datum = tt(dst[idx][0]).float().to(device)
+                tmp_datum = tmp_datum.view(1, *tmp_datum.size())
+                tmp_label = torch.Tensor([dst[idx][1]]).long().to(device)
+                tmp_label = tmp_label.view(1, )
+                if imidx == 0:
+                    gt_data = tmp_datum
+                    gt_label = tmp_label
+                else:
+                    gt_data = torch.cat((gt_data, tmp_datum), dim=0)  # tensor拼接
+                    gt_label = torch.cat((gt_label, tmp_label), dim=0)
+
+            # compute original gradient
+            out = net(gt_data)
+            y = criterion(out, gt_label)  # 计算loss
+            dy_dx = torch.autograd.grad(y, net.parameters())  # 通过自动求微分得到真实梯度
+            # 这一步是一个列表推导式，先从dy_dx这个Tensor中一步一步取元素出来，对原有的tensor进行克隆， 放在一个list中
+            # https://blog.csdn.net/Answer3664/article/details/104417013
+            original_dy_dx = list((_.detach().clone() for _ in dy_dx))
+
+            # generate dummy data and label
+            dummy_data = torch.randn(gt_data.size()).to(device).requires_grad_(True)  # 初始化虚拟参数
+            dummy_label = torch.randn((gt_data.shape[0], num_classes)).to(device).requires_grad_(True)
+
+            if method == 'DLG':
+                # LBFGS具有收敛速度快、内存开销少等优点？？？
+                optimizer = torch.optim.LBFGS([dummy_data, dummy_label], lr=lr)  # 设置优化器为拟牛顿法
+            elif method == 'iDLG':
+                optimizer = torch.optim.LBFGS([dummy_data, ], lr=lr)
+                # predict the ground-truth label
+                label_pred = torch.argmin(torch.sum(original_dy_dx[-2], dim=-1), dim=-1).detach().reshape(
+                    (1,)).requires_grad_(False)
+
+            history = []
+            history_iters = []
+            losses = []
+            mses = []
+            train_iters = []
+
+            print('lr =', lr)
+            for iters in range(Iteration):
+
+                def closure():
+                    # 清空过往梯度
+                    optimizer.zero_grad()
+                    pred = net(dummy_data)
+                    if method == 'DLG':
+                        # 将假的预测进行softmax归一化，转换为概率
+                        dummy_loss = - torch.mean(
+                            torch.sum(torch.softmax(dummy_label, -1) * torch.log(torch.softmax(pred, -1)), dim=-1))
+                        # dummy_loss = criterion(pred, gt_label)
+                    elif method == 'iDLG':
+                        dummy_loss = criterion(pred, label_pred)
+
+                    dummy_dy_dx = torch.autograd.grad(dummy_loss, net.parameters(), create_graph=True)
+
+                    grad_diff = 0
+                    for gx, gy in zip(dummy_dy_dx, original_dy_dx):
+                        grad_diff += ((gx - gy) ** 2).sum()
+                    grad_diff.backward()
+                    return grad_diff
+
+                optimizer.step(closure)
+                current_loss = closure().item()
+                train_iters.append(iters)
+                losses.append(current_loss)
+                mses.append(torch.mean((dummy_data - gt_data) ** 2).item())
+
+                if iters % int(Iteration / 30) == 0:
+                    current_time = str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))
+                    print(current_time, iters, 'loss = %.8f, mse = %.8f' % (current_loss, mses[-1]))
+                    history.append([tp(dummy_data[imidx].cpu()) for imidx in range(num_dummy)])
+                    history_iters.append(iters)
+
+                    for imidx in range(num_dummy):
+                        plt.figure(figsize=(12, 8))
+                        plt.subplot(3, 10, 1)
+                        # plt.imshow(tp(gt_data[imidx].cpu()))
+                        # 得到灰度图像
+                        plt.imshow(tp(gt_data[imidx].cpu()), cmap='gray')
+                        plt.title('Truth image')
+                        for i in range(min(len(history), 29)):
+                            plt.subplot(3, 10, i + 2)
+
+                            plt.imshow(history[i][imidx], cmap='gray')  # 这一行是显示灰度图片的意思, 如果不是mnist数据集，将这一行改为如下
+                            # plt.imshow(history[i][imidx])
+                            plt.title('iter=%d' % (history_iters[i]))
+                            plt.axis('off')
+                        if method == 'DLG':
+                            plt.savefig('%s/DLG_on_%s_%05d.png' % (save_path, imidx_list, imidx_list[imidx]))
+                            plt.close()
+                        elif method == 'iDLG':
+                            plt.savefig('%s/iDLG_on_%s_%05d.png' % (save_path, imidx_list, imidx_list[imidx]))
+                            plt.close()
+
+                    if current_loss < 0.000001:  # 收敛阈值
+                        break
+
+            if method == 'DLG':
+                loss_DLG = losses
+                label_DLG = torch.argmax(dummy_label, dim=-1).detach().item()
+                mse_DLG = mses
+            elif method == 'iDLG':
+                loss_iDLG = losses
+                label_iDLG = label_pred.item()
+                mse_iDLG = mses
+
+        print('imidx_list:', imidx_list)
+        print('loss_DLG:', loss_DLG[-1], 'loss_iDLG:', loss_iDLG[-1])
+        print('mse_DLG:', mse_DLG[-1], 'mse_iDLG:', mse_iDLG[-1])
+        print('gt_label:', gt_label.detach().cpu().data.numpy(), 'lab_DLG:', label_DLG, 'lab_iDLG:', label_iDLG)
+
+        print('----------------------\n\n')
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
 
-    parser.add_argument("--experiment_name", type=str, default='test', help="the name of experiment")
-    parser.add_argument("--dataset_name", type=str, default='nybc', help="dataset",
-                        choices=['nybc', 'tokyoci', 'gowallaci'])
-    parser.add_argument("--data_dir", type=str, default='data/mta_1706.csv', help="the address of a selected dataset")
-    parser.add_argument("--usernum", type=int, default=1, help="user number")
-    parser.add_argument("--batch_size", type=int, default=1, help="the size of data used in training")
-    parser.add_argument("--model_name", type=str, default='LSTM', help="the model you use",
-                        choices=['LSTM', 'PMF', 'DeepMove'])
-    parser.add_argument("--lr", type=float, default=0.001, help="learning rate for original task")
-    parser.add_argument("--hidden_size", type=int, default=16, help="the hidden size of model")
-    parser.add_argument("--experiment_rounds", type=int, default=100, help="the rounds of experiments")
-    parser.add_argument("--global_iterations", type=int, default=2000, help="the global iterations for original task")
+    main()
 
-    # param for DLG
-    parser.add_argument("--is_dlg", type=int, default=1, help="if use dlg")
-    parser.add_argument("--dlg_attack_interval", type=int, default=5, help="the interval between two dlg attack")
-    parser.add_argument("--dlg_attack_rounds", type=int, default=4, help="the rounds of dlg attack")
-    parser.add_argument("--dlg_iterations", type=int, default=200, help="the iterations for dlg attack")
-    parser.add_argument("--dlg_lr", type=float, default=0.05, help="learning rate for dlg attack")
-
-    # param for DP-SGD
-    parser.add_argument("--is_DP", type=int, default=0, help="if use DP")
-    parser.add_argument("--dp_C", type=float, default=0.2, help="clipping threshold in DP")
-    parser.add_argument("--dp_epsilon", type=float, default=8, help="epsilon in DP")
-    parser.add_argument("--dp_delta", type=float, default=1e-5, help="delta in DP")
-
-    # param for Geo-Indistinguishability
-    parser.add_argument("--is_geo", type=int, default=0, help="if use geo")
-    parser.add_argument("--geo_epsilon", type=float, default=8, help="epsilon in geo")
-
-    # param for Geo-Graph-Indistinguishability
-    parser.add_argument("--is_geogi", type=int, default=0, help="if use geogi")
-    parser.add_argument("--geogi_cover", type=int, default=5, help="(-cover, cover)")
-    parser.add_argument("--geogi_epsilon", type=float, default=8, help="epsilon in geogi")
-
-    args = parser.parse_args()
-
-    main(args)
